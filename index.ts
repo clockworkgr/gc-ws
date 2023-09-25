@@ -1,4 +1,5 @@
 import { ServerWebSocket } from "bun";
+import { v4 as uuid, v4 }  from "uuid";
 
 type GnoChessData = {
     token: string;
@@ -35,6 +36,7 @@ type GnoRPCParams = {
 }
 
 type GnoChessMsgDataGeneric<T extends GnoRPC> = {
+    id: string,
     type: T,
     params: GnoRPCParams[T]
 }
@@ -47,8 +49,9 @@ type GnoChessMsgData = { [K in GnoRPC]: GnoChessMsgDataGeneric<K> }[GnoRPC]
 const Players: string[] = [];
 const Games: Map<number, [string, string, 0 | 1, GameMoves]> = new Map(); // 0 or 1 is whose turn it is
 const InGame: Map<string, number | null> = new Map();
-function makeError(errorMsg: string): GnoChessMsgDataGeneric<GnoRPC.ERROR> {
+function makeError(id: string, errorMsg: string): GnoChessMsgDataGeneric<GnoRPC.ERROR> {
     return {
+        id,
         type: GnoRPC.ERROR,
         params: [errorMsg]
     }
@@ -80,12 +83,12 @@ const server = Bun.serve<GnoChessData>({
             try {
                 msg = JSON.parse(message.toString())
             } catch (e) {
-                sendMessage(ws, makeError("Could not parse message."))
+                sendMessage(ws, makeError(uuid(), "Could not parse message."))
                 return
             }
             switch (msg.type) {
                 case GnoRPC.PING:
-                    sendMessage(ws, { type: GnoRPC.PONG, params: [] })
+                    sendMessage(ws, { id: msg.id, type: GnoRPC.PONG, params: [] })
                     break
                 case GnoRPC.JOINED_LOBBY:
                     InGame.set(ws.data.token, null)
@@ -96,7 +99,7 @@ const server = Bun.serve<GnoChessData>({
                 case GnoRPC.JOINED_GAME:
                     InGame.set(ws.data.token, msg.params[0]);
                     ws.subscribe("game"+msg.params[0]);                    
-                    const game: typeof Games extends Map<number, infer I> ? I : never = Games.get(msg.params[0]) || ['', '', 0, []]
+                    const game = Games.get(msg.params[0]) || ['', '', 0, []]
                     let opponent:string;
                     if (msg.params[1] == ChessSide.WHITE) {
                         game[0] = ws.data.token
@@ -109,8 +112,22 @@ const server = Bun.serve<GnoChessData>({
                     ws.publish("game"+msg.params[0], message)                    
                     break
                 case GnoRPC.LEFT_GAME:
-                    const leftGame = InGame.get(ws.data.token)
+                    const leftGame = InGame.get(ws.data.token)                
                     if (leftGame) {
+                        const game = Games.get(leftGame)
+                        if (game) {
+                            if (game[0] == ws.data.token) {
+                                game[0] = ""
+                            }
+                            if (game[1] == ws.data.token) {
+                                game[1] = ""
+                            }
+                            if (game[0] == "" && game[1] == "") {
+                                Games.delete(leftGame)
+                            } else {
+                                Games.set(leftGame,game)
+                            }                            
+                        }
                         InGame.set(ws.data.token, null)
                         ws.publish("game"+leftGame, message)                    
                     }
@@ -126,19 +143,52 @@ const server = Bun.serve<GnoChessData>({
                             ws.publish("game"+inGame, message)                    
                         }
                     }
+                    break
                 case GnoRPC.REQUEST_DRAW:
-
-                    InGame.set(ws.data.token, null);
-                    break;
+                    const resignedGame = InGame.get(ws.data.token)
+                    InGame.set(ws.data.token, null)
+                    ws.publish("game"+resignedGame, message)
+                    break
+                case GnoRPC.TURN_TIMER_START:
+                    const startTurnGame = InGame.get(ws.data.token)
+                    ws.publish("game" + startTurnGame, message)
+                    break
+                case GnoRPC.TURN_TIMER_END:
+                    const endTurnGame = InGame.get(ws.data.token)
+                    ws.publish("game" + endTurnGame, message)
+                    break
                 case GnoRPC.GET_STATS:
-                    console.log(InGame);
-                    console.log(Players);
-                    console.log(Games);
-                    break;
-
-
+                    const stats = {
+                        players: Players.length,
+                        games_in_progress: Games.size,
+                        players_available: Players.length - InGame.size
+                    }
+                    ws.send(JSON.stringify(stats))
+                    break
             }
          }, 
-        close(ws, code, message) { }, 
+        close(ws, code, message) {
+            Players.splice(Players.indexOf(ws.data.token), 1)
+            const abortedGame = InGame.get(ws.data.token)
+            if (abortedGame) {                
+                const game = Games.get(abortedGame)
+                if (game) {
+                    if (game[0] == ws.data.token) {
+                        game[0] = ""                        
+                    }
+                    if (game[1] == ws.data.token) {
+                        game[1] = ""
+                    }
+                    if (game[0] == "" && game[1] == "") {
+                        Games.delete(abortedGame)
+                    } else {
+                        Games.set(abortedGame, game)
+                    }
+                    ws.publish("game"+abortedGame, JSON.stringify({id: uuid(), type: GnoRPC.LEFT_GAME, params:[]}) )
+                }
+            }
+            InGame.delete(ws.data.token)
+            
+        }, 
     },
 });
